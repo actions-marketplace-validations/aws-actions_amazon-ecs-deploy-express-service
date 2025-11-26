@@ -1,7 +1,12 @@
+// GitHub Action for deploying ECS Express services
+// Trigger deployment test
 const core = require('@actions/core');
 const { 
   ECSClient, 
   DescribeServicesCommand,
+  DescribeExpressGatewayServiceCommand,
+  DescribeServiceDeploymentsCommand,
+  ListServiceDeploymentsCommand,
   CreateExpressGatewayServiceCommand,
   UpdateExpressGatewayServiceCommand
 } = require('@aws-sdk/client-ecs');
@@ -265,10 +270,13 @@ async function run() {
     
     // Create or update the service
     let response;
+    let deploymentStartTime;
     try {
       if (serviceExists && serviceArn) {
         // Update existing service
         core.info('Updating Express Gateway service...');
+        // Capture timestamp right before making the API call
+        deploymentStartTime = new Date();
         const updateCommand = new UpdateExpressGatewayServiceCommand({
           serviceArn: serviceArn,
           ...serviceConfig
@@ -278,6 +286,8 @@ async function run() {
       } else {
         // Create new service
         core.info('Creating Express Gateway service...');
+        // Capture timestamp right before making the API call
+        deploymentStartTime = new Date();
         const createCommand = new CreateExpressGatewayServiceCommand(serviceConfig);
         response = await ecs.send(createCommand);
         core.info('Service created successfully');
@@ -297,9 +307,162 @@ async function run() {
     
     core.debug(`Service response: ${JSON.stringify(response, null, 2)}`);
     
+    // Get the service ARN from response
+    const finalServiceArn = response?.service?.serviceArn || serviceArn;
+    
+    // Set service ARN output
+    if (finalServiceArn) {
+      core.setOutput('service-arn', finalServiceArn);
+      core.info(`Service ARN: ${finalServiceArn}`);
+    }
+    
+    // Wait for deployment to complete
+    await waitForServiceStable(ecs, finalServiceArn, deploymentStartTime);
+    
   } catch (error) {
     core.setFailed(error.message);
     core.debug(error.stack);
+  }
+}
+
+/**
+ * Wait for Express Gateway service to reach stable state
+ * 1. Describe service to get current status
+ * 2. List service deployments to get deployment ARNs (avoids DB consistency issues)
+ * 3. Wait for service status to become ACTIVE
+ * 4. Wait for deployment status to become SUCCESSFUL
+ * 
+ * @param {ECSClient} ecs - The ECS client
+ * @param {string} serviceArn - The service ARN
+ * @param {Date} deploymentStartTime - Timestamp when the deployment was initiated
+ */
+async function waitForServiceStable(ecs, serviceArn, deploymentStartTime) {
+  core.info('Waiting for service deployment to complete...');
+  const maxWaitMinutes = 15;
+  const pollIntervalSeconds = 15;
+  const maxWaitMs = maxWaitMinutes * 60 * 1000;
+  const startTime = Date.now();
+  
+  let serviceActive = false;
+  let deploymentArn = null;
+  
+  while (true) {
+    // Check timeout
+    if (Date.now() - startTime > maxWaitMs) {
+      core.warning(`Deployment is taking longer than ${maxWaitMinutes} minutes. The deployment will continue in the background.`);
+      break;
+    }
+    
+    try {
+      // Step 1: Check service status using DescribeExpressGatewayService
+      const describeServiceCommand = new DescribeExpressGatewayServiceCommand({
+        serviceArn: serviceArn
+      });
+      const serviceResponse = await ecs.send(describeServiceCommand);
+      
+      if (serviceResponse.service) {
+        const service = serviceResponse.service;
+        const statusCode = service.status?.statusCode;
+        
+        // Log the actual service ARN from the response for debugging
+        if (service.serviceArn && service.serviceArn !== serviceArn) {
+          core.debug(`Service ARN from response: ${service.serviceArn}`);
+        }
+        
+        // Check for failure states
+        if (statusCode === 'INACTIVE' || statusCode === 'DRAINING') {
+          throw new Error(`Service entered ${statusCode} state`);
+        }
+        
+        // Check if service is ACTIVE
+        if (statusCode === 'ACTIVE') {
+          if (!serviceActive) {
+            serviceActive = true;
+          }
+          
+          // Step 2: List service deployments to get deployment ARNs
+          // This follows CloudFormation's pattern to avoid DB consistency issues
+          // Filter for deployments created after our action initiated the deployment
+          if (!deploymentArn) {
+            try {
+              core.debug(`Calling ListServiceDeployments with service ARN: ${serviceArn}, filtering for deployments after ${deploymentStartTime.toISOString()}`);
+              const listDeploymentsCommand = new ListServiceDeploymentsCommand({
+                cluster: service.cluster || 'default',
+                service: serviceArn,
+                createdAt: {
+                  after: deploymentStartTime
+                }
+              });
+              const listResponse = await ecs.send(listDeploymentsCommand);
+              
+              // Log the full response for debugging
+              core.debug(`ListServiceDeployments response: ${JSON.stringify(listResponse, null, 2)}`);
+              
+              const deploymentCount = listResponse.serviceDeployments?.length || 0;
+              core.info(`Found ${deploymentCount} deployment(s) created after ${deploymentStartTime.toISOString()}`);
+              
+              if (listResponse.serviceDeployments && listResponse.serviceDeployments.length > 0) {
+                // Get the most recent deployment (first in the list)
+                const deployment = listResponse.serviceDeployments[0];
+                deploymentArn = deployment.serviceDeploymentArn;
+                core.info(`Monitoring deployment: ${deploymentArn}`);
+              } else {
+                core.debug('No deployments found yet, will retry...');
+              }
+            } catch (listError) {
+              core.warning(`ListServiceDeployments error: ${listError.message}. Service ARN: ${serviceArn}`);
+            }
+          }
+          
+          // Step 3: Check deployment status using DescribeServiceDeployments
+          if (deploymentArn) {
+            const describeDeploymentCommand = new DescribeServiceDeploymentsCommand({
+              serviceDeploymentArns: [deploymentArn]
+            });
+            const deploymentResponse = await ecs.send(describeDeploymentCommand);
+            
+            if (deploymentResponse.serviceDeployments && deploymentResponse.serviceDeployments.length > 0) {
+              const deployment = deploymentResponse.serviceDeployments[0];
+              const deploymentStatus = deployment.status;
+              
+              core.info(`Deployment ${deploymentArn} status: ${deploymentStatus}. Will re-poll in ${pollIntervalSeconds} seconds...`);
+              
+              // Check for deployment failure
+              if (deploymentStatus === 'FAILED' || deploymentStatus === 'STOPPED') {
+                throw new Error(`Deployment ${deploymentArn} ${deploymentStatus}`);
+              }
+              
+              // Deployment is complete when status is SUCCESSFUL
+              if (deploymentStatus === 'SUCCESSFUL') {
+                core.info('Deployment completed successfully');
+                
+                // Extract endpoint from active configurations
+                if (service.activeConfigurations && 
+                    service.activeConfigurations.length > 0 &&
+                    service.activeConfigurations[0].ingressPaths &&
+                    service.activeConfigurations[0].ingressPaths.length > 0) {
+                  const endpoint = service.activeConfigurations[0].ingressPaths[0].endpoint;
+                  if (endpoint) {
+                    core.setOutput('endpoint', endpoint);
+                    core.info(`Service endpoint: ${endpoint}`);
+                  }
+                }
+                return;
+              }
+            }
+          }
+        }
+      }
+    } catch (error) {
+      // Only warn on transient errors, throw on actual failures
+      if (error.message.includes('entered') || error.message.includes('FAILED') || error.message.includes('STOPPED')) {
+        throw error;
+      }
+      core.warning(`Error checking status: ${error.message}`);
+    }
+    
+    // Wait before next poll
+    await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
   }
 }
 
