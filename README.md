@@ -11,6 +11,7 @@ Deploys an Amazon ECS Express Mode service. ECS Express Mode is a simplified dep
 - [Outputs](#outputs)
 - [IAM Permissions](#iam-permissions)
 - [Examples](#examples)
+- [Best Practices](#best-practices)
 
 
 ## Overview
@@ -94,6 +95,12 @@ See [IAM Permissions](#iam-permissions) for detailed policy requirements.
         {"name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-password"}
       ]
     command: '["node", "server.js"]'
+    tags: |
+      [
+        {"key": "Environment", "value": "production"},
+        {"key": "Team", "value": "backend"},
+        {"key": "CostCenter", "value": "engineering"}
+      ]
     
     # Resource configuration
     cpu: '1024'
@@ -142,6 +149,7 @@ See [IAM Permissions](#iam-permissions) for detailed policy requirements.
 | `log-group` | CloudWatch Logs log group name for container logs. If not specified, Express Mode creates a log group automatically. | - |
 | `log-stream-prefix` | CloudWatch Logs stream prefix for container logs. If not specified, Express Mode uses a default prefix. | - |
 | `repository-credentials` | ARN of the secret containing credentials for private container registry. Required for private registries outside ECR. | - |
+| `tags` | Resource tags to apply to the ECS Express Gateway service and associated AWS resources. Provide as JSON array: `[{"key":"Environment","value":"Production"}]` or multiline format: `Environment=Production` | - |
 
 ### Resource Configuration
 
@@ -290,6 +298,8 @@ jobs:
 
 ### Deploy with Auto-Scaling
 
+Express Mode Services are setup with preset defaults 
+
 ```yaml
 - name: Deploy with auto-scaling
   uses: aws-actions/amazon-ecs-deploy-express-service@v1
@@ -305,6 +315,50 @@ jobs:
     auto-scaling-metric: AVERAGE_CPU
     auto-scaling-target-value: 70
 ```
+
+## Best Practices
+https://docs.aws.amazon.com/AmazonECS/latest/developerguide/express-service-best-practices.html
+
+### Deploy with Resource Tags
+
+The action supports two input formats for tags:
+
+**JSON Format**:
+```yaml
+- name: Deploy with tags (JSON format)
+  uses: aws-actions/amazon-ecs-deploy-express-service@v1
+  with:
+    service-name: my-app
+    image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app:latest
+    execution-role-arn: arn:aws:iam::123456789012:role/ecsTaskExecutionRole
+    infrastructure-role-arn: arn:aws:iam::123456789012:role/ecsInfrastructureRole
+    tags: |
+      [
+        {"key": "Environment", "value": "Production"},
+        {"key": "Team", "value": "DevOps"},
+        {"key": "CostCenter", "value": "Engineering"},
+        {"key": "Project", "value": "WebApp"}
+      ]
+```
+
+**Multiline Format**:
+```yaml
+- name: Deploy with tags (multiline format)
+  uses: aws-actions/amazon-ecs-deploy-express-service@v1
+  with:
+    service-name: my-app
+    image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-app:latest
+    execution-role-arn: arn:aws:iam::123456789012:role/ecsTaskExecutionRole
+    infrastructure-role-arn: arn:aws:iam::123456789012:role/ecsInfrastructureRole
+    tags: |
+      Environment=Production
+      Team=DevOps
+      CostCenter=Engineering
+      Project=WebApp
+```
+
+
+
 
 ## Troubleshooting
 
@@ -324,6 +378,8 @@ jobs:
 
 - For custom clusters, ensure the cluster exists before running the action
 - The action will automatically create the default cluster if it doesn't exist
+
+
 
 ## Security
 
