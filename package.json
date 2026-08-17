@@ -1,6 +1,6 @@
 {
   "name": "amazon-ecs-deploy-express-service",
-  "version": "1.2.0",
+  "version": "1.2.2",
   "description": "GitHub Action to deploy containerized applications to Amazon ECS Express Mode services",
   "main": "index.js",
   "scripts": {
@@ -23,12 +23,12 @@
   "license": "MIT",
   "dependencies": {
     "@actions/core": "^2.0.2",
-    "@aws-sdk/client-ecs": "^3.940.0"
+    "@aws-sdk/client-ecs": "^3.1101.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",
-    "@vercel/ncc": "^0.38.3",
-    "eslint": "^10.0.0",
-    "jest": "^30.2.0"
+    "@vercel/ncc": "^0.44.1",
+    "eslint": "^10.8.0",
+    "jest": "^30.4.2"
   }
 }

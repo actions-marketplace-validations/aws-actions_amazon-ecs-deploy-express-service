@@ -13,6 +13,16 @@ const {
   UntagResourceCommand
 } = require('@aws-sdk/client-ecs');
 
+// Service deployment statuses that mean the deployment will not succeed. A rollback
+// (whether it succeeds or fails) means the new revision never became healthy, so both
+// ROLLBACK_* terminal states are failures. Note ServiceDeploymentStatus has no 'FAILED'
+// value, so the previous check for it never matched.
+const TERMINAL_FAILURE_STATUSES = new Set([
+  'ROLLBACK_SUCCESSFUL',
+  'ROLLBACK_FAILED',
+  'STOPPED'
+]);
+
 /**
  * Parse tags from JSON format input
  * Expected format: [{"key":"Environment","value":"Production"}]
@@ -164,26 +174,37 @@ async function run() {
     const image = core.getInput('image', { required: false });
     const executionRoleArn = core.getInput('execution-role-arn', { required: false });
     const infrastructureRoleArn = core.getInput('infrastructure-role-arn', { required: false });
-    
+    const taskDefinitionArn = core.getInput('task-definition-arn', { required: false });
+
+    // When a task definition ARN is provided, the task definition manages the container
+    // and task-level settings, so the container-related inputs are not allowed
+    const isTaskDefinitionMode = !!(taskDefinitionArn && taskDefinitionArn.trim() !== '');
+
     // Validate required inputs are not empty
     if (!serviceName || serviceName.trim() === '') {
       throw new Error('Input required and not supplied: service-name');
     }
-    
-    if (!image || image.trim() === '') {
-      throw new Error('Input required and not supplied: image');
+
+    if (!isTaskDefinitionMode) {
+      if (!image || image.trim() === '') {
+        throw new Error('Input required and not supplied: image');
+      }
+
+      if (!executionRoleArn || executionRoleArn.trim() === '') {
+        throw new Error('Input required and not supplied: execution-role-arn');
+      }
     }
-    
-    if (!executionRoleArn || executionRoleArn.trim() === '') {
-      throw new Error('Input required and not supplied: execution-role-arn');
-    }
-    
+
     if (!infrastructureRoleArn || infrastructureRoleArn.trim() === '') {
       throw new Error('Input required and not supplied: infrastructure-role-arn');
     }
-    
-    core.info(`Container image: ${image}`);
-    core.debug(`Execution role ARN: ${executionRoleArn}`);
+
+    if (isTaskDefinitionMode) {
+      core.info(`Task definition: ${taskDefinitionArn}`);
+    } else {
+      core.info(`Container image: ${image}`);
+      core.debug(`Execution role ARN: ${executionRoleArn}`);
+    }
     core.debug(`Infrastructure role ARN: ${infrastructureRoleArn}`);
     
     // Create ECS client with custom user agent
@@ -226,16 +247,43 @@ async function run() {
     const maxTaskCount = core.getInput('max-task-count', { required: false });
     const autoScalingMetric = core.getInput('auto-scaling-metric', { required: false });
     const autoScalingTargetValue = core.getInput('auto-scaling-target-value', { required: false });
-    
+
+    // The ECS API rejects requests that combine taskDefinitionArn with primaryContainer,
+    // executionRoleArn, taskRoleArn, cpu, or memory; fail fast with a clear message instead
+    if (isTaskDefinitionMode) {
+      const conflictingInputs = [
+        ['image', image],
+        ['execution-role-arn', executionRoleArn],
+        ['task-role-arn', taskRoleArn],
+        ['cpu', cpu],
+        ['memory', memory],
+        ['container-port', containerPort],
+        ['environment-variables', environmentVariables],
+        ['secrets', secrets],
+        ['command', command],
+        ['log-group', logGroup],
+        ['log-stream-prefix', logStreamPrefix],
+        ['repository-credentials', repositoryCredentials]
+      ].filter(([, value]) => value && value.trim() !== '').map(([name]) => name);
+
+      if (conflictingInputs.length > 0) {
+        throw new Error(`The following inputs cannot be used with task-definition-arn: ${conflictingInputs.join(', ')}. These settings must be defined in the task definition instead.`);
+      }
+    }
+
     // Get AWS region from ECS client config
     const region = await ecs.config.region();
     core.debug(`AWS Region: ${region}`);
-    
-    // Parse account ID from execution-role-arn
+
+    // Parse account ID from an IAM role ARN
     // Format: arn:aws:iam::ACCOUNT-ID:role/name
-    const arnParts = executionRoleArn.split(':');
+    // execution-role-arn is not allowed in task definition mode, so fall back to
+    // infrastructure-role-arn (required in both modes) there
+    const accountIdSourceName = isTaskDefinitionMode ? 'infrastructure-role-arn' : 'execution-role-arn';
+    const accountIdSourceArn = isTaskDefinitionMode ? infrastructureRoleArn : executionRoleArn;
+    const arnParts = accountIdSourceArn.split(':');
     if (arnParts.length < 5) {
-      throw new Error(`Invalid execution-role-arn format: ${executionRoleArn}`);
+      throw new Error(`Invalid ${accountIdSourceName} format: ${accountIdSourceArn}`);
     }
     const accountId = arnParts[4];
     core.debug(`AWS Account ID: ${accountId}`);
@@ -287,14 +335,22 @@ async function run() {
     }
     
     // Build SDK command input object
-    const serviceConfig = {
-      executionRoleArn: executionRoleArn,
-      infrastructureRoleArn: infrastructureRoleArn,
-      primaryContainer: {
-        image: image
-      }
-    };
-    
+    // In task definition mode the task definition supplies the container, roles, cpu,
+    // and memory settings; the conflicting inputs were rejected above, so the optional
+    // blocks below are no-ops in that mode
+    const serviceConfig = isTaskDefinitionMode
+      ? {
+          taskDefinitionArn: taskDefinitionArn,
+          infrastructureRoleArn: infrastructureRoleArn
+        }
+      : {
+          executionRoleArn: executionRoleArn,
+          infrastructureRoleArn: infrastructureRoleArn,
+          primaryContainer: {
+            image: image
+          }
+        };
+
     // Add optional container configuration
     if (containerPort && containerPort.trim() !== '') {
       serviceConfig.primaryContainer.containerPort = parseInt(containerPort, 10);
@@ -553,7 +609,9 @@ async function waitForServiceStable(ecs, serviceArn, deploymentStartTime) {
         
         // Check for failure states
         if (statusCode === 'INACTIVE' || statusCode === 'DRAINING') {
-          throw new Error(`Service entered ${statusCode} state`);
+          const failure = new Error(`Service entered ${statusCode} state`);
+          failure.isTerminalFailure = true;
+          throw failure;
         }
         
         // Check if service is ACTIVE
@@ -608,12 +666,17 @@ async function waitForServiceStable(ecs, serviceArn, deploymentStartTime) {
               const deploymentStatus = deployment.status;
               
               core.info(`Deployment ${deploymentArn} status: ${deploymentStatus}. Will re-poll in ${pollIntervalSeconds} seconds...`);
-              
-              // Check for deployment failure
-              if (deploymentStatus === 'FAILED' || deploymentStatus === 'STOPPED') {
-                throw new Error(`Deployment ${deploymentArn} ${deploymentStatus}`);
+
+              // Check for terminal failure states. A rollback (successful or failed) means
+              // the new revision did not become healthy, so both are deployment failures.
+              // ServiceDeploymentStatus has no 'FAILED' value; the real terminal failures
+              // are ROLLBACK_SUCCESSFUL, ROLLBACK_FAILED, and STOPPED.
+              if (TERMINAL_FAILURE_STATUSES.has(deploymentStatus)) {
+                const failure = new Error(`Deployment ${deploymentArn} ${deploymentStatus}`);
+                failure.isTerminalFailure = true;
+                throw failure;
               }
-              
+
               // Deployment is complete when status is SUCCESSFUL
               if (deploymentStatus === 'SUCCESSFUL') {
                 core.info('Deployment completed successfully');
@@ -636,8 +699,8 @@ async function waitForServiceStable(ecs, serviceArn, deploymentStartTime) {
         }
       }
     } catch (error) {
-      // Only warn on transient errors, throw on actual failures
-      if (error.message.includes('entered') || error.message.includes('FAILED') || error.message.includes('STOPPED')) {
+      // Re-throw terminal failures; only warn and keep polling on transient errors
+      if (error.isTerminalFailure) {
         throw error;
       }
       core.warning(`Error checking status: ${error.message}`);
